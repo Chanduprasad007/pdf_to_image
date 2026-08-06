@@ -2,7 +2,9 @@
 
 A simple Streamlit web app that:
 - uploads one or more PDF files
-- converts each page into a PNG image
+- converts eligible PDF pages into PNG images
+- skips welcome, instructions, closing, and other pages that do not contain both
+  a smallcase title and Research Analyst
 - names each image using the detected large title and Research Analyst in the
   format `<title> by <research analyst>`
 - creates a ZIP download per PDF
