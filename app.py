@@ -54,6 +54,31 @@ def get_page_title(page: fitz.Page) -> str:
     return best_span[0] if best_span else ""
 
 
+def get_research_analyst(page: fitz.Page) -> str:
+    """Return the value printed next to or below the Research Analyst label."""
+    lines = [
+        re.sub(r'\s+', ' ', line).strip()
+        for line in page.get_text("text", sort=True).splitlines()
+        if line.strip()
+    ]
+
+    for index, line in enumerate(lines):
+        match = re.match(r'^research\s+analyst\b\s*[:\-]?\s*(.*)$', line, re.IGNORECASE)
+        if not match:
+            continue
+
+        # Some PDFs place the value on the same line as the label.
+        inline_value = match.group(1).strip()
+        if inline_value:
+            return inline_value
+
+        # In the usual report layout, the value is the next extracted line.
+        if index + 1 < len(lines):
+            return lines[index + 1]
+
+    return ""
+
+
 def convert_pdf_bytes(pdf_bytes: bytes, original_name: str, zoom: float = 2.0):
     results = []
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -65,7 +90,9 @@ def convert_pdf_bytes(pdf_bytes: bytes, original_name: str, zoom: float = 2.0):
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
         for i, page in enumerate(doc, start=1):
             title_raw = get_page_title(page) or f"page_{i}"
-            title = safe_name(title_raw)
+            analyst_raw = get_research_analyst(page)
+            display_name = f"{title_raw} by {analyst_raw}" if analyst_raw else title_raw
+            title = safe_name(display_name)
             image_path = unique_path(out_dir / f"{title}.png")
             pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
             pix.save(str(image_path))
@@ -93,7 +120,7 @@ def convert_pdf_bytes(pdf_bytes: bytes, original_name: str, zoom: float = 2.0):
 
 
 st.title("PDF Pages to Images")
-st.write("Upload one or more PDF files. Each page is converted to a PNG and named from the large title at the top of the page.")
+st.write("Upload one or more PDF files. Each page is converted to a PNG and named from the large title and Research Analyst shown on the page.")
 
 col1, col2 = st.columns([2, 1])
 with col1:

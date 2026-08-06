@@ -3,7 +3,8 @@
 A simple Streamlit web app that:
 - uploads one or more PDF files
 - converts each page into a PNG image
-- names each image from the detected large title at the top of the page
+- names each image using the detected large title and Research Analyst in the
+  format `<title> by <research analyst>`
 - creates a ZIP download per PDF
 
 ## Setup
