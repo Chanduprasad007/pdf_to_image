@@ -3,12 +3,169 @@ import re
 import io
 import zipfile
 import tempfile
-import shutil
 
 import fitz  # PyMuPDF
 import streamlit as st
 
-st.set_page_config(page_title="PDF Pages to Images", page_icon="🧾", layout="wide")
+st.set_page_config(
+    page_title="PDF Page Exporter",
+    page_icon="📄",
+    layout="wide",
+    initial_sidebar_state="collapsed",
+)
+
+st.markdown(
+    """
+    <style>
+        :root {
+            --app-bg: oklch(0.975 0 0);
+            --surface: oklch(1 0 0);
+            --surface-subtle: oklch(0.955 0.008 140);
+            --ink: oklch(0.19 0.025 140);
+            --muted: oklch(0.46 0.02 140);
+            --line: oklch(0.88 0.012 140);
+            --primary: oklch(0.35 0.11 140);
+            --primary-hover: oklch(0.30 0.105 140);
+            --accent: oklch(0.58 0.13 235);
+            --focus: var(--accent);
+        }
+
+        .stApp { background: var(--app-bg); color: var(--ink); }
+        .block-container {
+            max-width: 1080px;
+            padding-top: 3.5rem;
+            padding-bottom: 5rem;
+        }
+        header[data-testid="stHeader"] { background: transparent; }
+
+        .app-hero {
+            display: flex;
+            align-items: center;
+            gap: 1rem;
+            margin-bottom: 2.5rem;
+        }
+        .app-mark {
+            display: grid;
+            place-items: center;
+            width: 3.25rem;
+            height: 3.25rem;
+            flex: 0 0 auto;
+            border-radius: 0.8rem;
+            background: var(--primary);
+            color: oklch(1 0 0);
+            font-size: 0.72rem;
+            font-weight: 750;
+            letter-spacing: 0.04em;
+            box-shadow: 0 0.5rem 1.5rem oklch(0.35 0.11 140 / 0.18);
+        }
+        .app-hero h1 {
+            margin: 0 0 0.25rem;
+            color: var(--ink);
+            font-size: 2rem;
+            line-height: 1.15;
+            letter-spacing: -0.025em;
+            text-wrap: balance;
+        }
+        .app-hero p {
+            max-width: 68ch;
+            margin: 0;
+            color: var(--muted);
+            font-size: 1rem;
+            line-height: 1.55;
+            text-wrap: pretty;
+        }
+        .workflow-note {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.65rem 1.25rem;
+            margin: -1rem 0 2.25rem;
+            color: var(--muted);
+            font-size: 0.875rem;
+        }
+        .workflow-note span { white-space: nowrap; }
+        .workflow-note strong { color: var(--ink); }
+
+        h2, h3 { color: var(--ink); letter-spacing: -0.015em; }
+        div[data-testid="stFileUploaderDropzone"] {
+            min-height: 12rem;
+            border: 1.5px dashed var(--line);
+            border-radius: 0.9rem;
+            background: var(--surface);
+            transition: border-color 180ms ease-out, background 180ms ease-out;
+        }
+        div[data-testid="stFileUploaderDropzone"]:hover {
+            border-color: var(--focus);
+            background: var(--surface-subtle);
+        }
+        div[data-testid="stFileUploaderDropzone"] button {
+            border-color: var(--line);
+            background: var(--surface);
+            color: var(--ink);
+        }
+        div[data-testid="stFileUploaderFile"] {
+            border-radius: 0.65rem;
+            background: var(--surface);
+        }
+
+        div[data-testid="stButton"] > button[kind="primary"],
+        div[data-testid="stDownloadButton"] > button {
+            min-height: 2.8rem;
+            border: 1px solid var(--primary);
+            border-radius: 0.65rem;
+            background: var(--primary);
+            color: oklch(1 0 0);
+            font-weight: 650;
+            transition: background 180ms ease-out, border-color 180ms ease-out,
+                        transform 180ms ease-out;
+        }
+        div[data-testid="stButton"] > button[kind="primary"]:hover,
+        div[data-testid="stDownloadButton"] > button:hover {
+            border-color: var(--primary-hover);
+            background: var(--primary-hover);
+            color: oklch(1 0 0);
+            transform: translateY(-1px);
+        }
+        div[data-testid="stButton"] > button:focus-visible,
+        div[data-testid="stDownloadButton"] > button:focus-visible {
+            outline: 3px solid oklch(0.68 0.13 140 / 0.35);
+            outline-offset: 2px;
+        }
+        div[data-testid="stButton"] > button:disabled {
+            border-color: var(--line);
+            background: oklch(0.89 0.008 140);
+            color: oklch(0.47 0.015 140);
+        }
+
+        div[data-testid="stVerticalBlockBorderWrapper"] {
+            border-color: var(--line) !important;
+            border-radius: 0.9rem !important;
+            background: var(--surface);
+            box-shadow: 0 0.35rem 1.5rem oklch(0.19 0.025 140 / 0.045);
+        }
+        div[data-testid="stAlert"] { border-radius: 0.65rem; }
+        div[data-testid="stExpander"] {
+            border-color: var(--line);
+            border-radius: 0.65rem;
+        }
+        div[data-testid="stImage"] img { border-radius: 0.55rem; }
+        .result-meta { color: var(--muted); font-size: 0.9rem; }
+
+        @media (max-width: 640px) {
+            .block-container { padding-top: 2rem; }
+            .app-hero { align-items: flex-start; }
+            .app-hero h1 { font-size: 1.65rem; }
+            .app-mark { width: 2.8rem; height: 2.8rem; }
+        }
+        @media (prefers-reduced-motion: reduce) {
+            *, *::before, *::after {
+                scroll-behavior: auto !important;
+                transition-duration: 0.01ms !important;
+            }
+        }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
 
 def safe_name(name: str) -> str:
@@ -124,45 +281,158 @@ def convert_pdf_bytes(pdf_bytes: bytes, original_name: str, zoom: float = 2.0):
         return results, zip_buffer.getvalue(), preview_images
 
 
-st.title("PDF Pages to Images")
-st.write("Upload one or more PDF files. Every page is converted to a PNG image. When a Research Analyst or Investment Advisor is present, the name is included in the filename.")
+def format_file_size(size_bytes: int) -> str:
+    if size_bytes < 1024 * 1024:
+        return f"{size_bytes / 1024:.1f} KB"
+    return f"{size_bytes / (1024 * 1024):.1f} MB"
 
-col1, col2 = st.columns([2, 1])
-with col1:
-    uploaded_files = st.file_uploader(
-        "Upload PDFs",
-        type=["pdf"],
-        accept_multiple_files=True,
-        help="You can select multiple PDF files in one go."
+
+st.markdown(
+    """
+    <div class="app-hero">
+        <div class="app-mark">PNG</div>
+        <div>
+            <h1>PDF page exporter</h1>
+            <p>Turn every page into a crisp PNG, automatically named using the page title and its Research Analyst or Investment Advisor.</p>
+        </div>
+    </div>
+    <div class="workflow-note" aria-label="Conversion steps">
+        <span><strong>1.</strong> Select one or more PDFs</span>
+        <span><strong>2.</strong> Convert every page</span>
+        <span><strong>3.</strong> Download a separate ZIP for each PDF</span>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
+st.subheader("Upload PDFs")
+st.caption("Select multiple files in one go. Each PDF is processed independently.")
+uploaded_files = st.file_uploader(
+    "Choose PDF files",
+    type=["pdf"],
+    accept_multiple_files=True,
+    help="Drag and drop several PDF files here, or browse to select them.",
+    label_visibility="collapsed",
+)
+
+control_col, action_col = st.columns([1.15, 1], vertical_alignment="bottom")
+with control_col:
+    zoom = st.select_slider(
+        "Image resolution",
+        options=[1.0, 1.5, 2.0, 2.5, 3.0],
+        value=2.0,
+        format_func=lambda value: {
+            1.0: "Standard",
+            1.5: "Balanced",
+            2.0: "High",
+            2.5: "Very high",
+            3.0: "Maximum",
+        }[value],
+        help="Higher resolution creates sharper PNGs and larger ZIP files.",
     )
-with col2:
-    zoom = st.slider("Image quality", min_value=1.0, max_value=3.0, value=2.0, step=0.5)
 
-process = st.button("Convert PDFs", type="primary", disabled=not uploaded_files)
+file_count = len(uploaded_files) if uploaded_files else 0
+with action_col:
+    process = st.button(
+        f"Convert {file_count} PDF{'s' if file_count != 1 else ''}",
+        type="primary",
+        disabled=not uploaded_files,
+        use_container_width=True,
+    )
+
+if uploaded_files:
+    total_upload_size = sum(uploaded.size for uploaded in uploaded_files)
+    st.info(
+        f"Ready to process {file_count} PDF{'s' if file_count != 1 else ''} "
+        f"({format_file_size(total_upload_size)} total)."
+    )
+
+if "conversion_outputs" not in st.session_state:
+    st.session_state.conversion_outputs = []
 
 if process and uploaded_files:
-    for uploaded in uploaded_files:
-        with st.container(border=True):
-            st.subheader(uploaded.name)
-            with st.spinner(f"Processing {uploaded.name}..."):
-                results, zip_bytes, previews = convert_pdf_bytes(uploaded.getvalue(), uploaded.name, zoom=zoom)
+    batch_outputs = []
+    progress_bar = st.progress(0)
+    progress_text = st.empty()
 
-            st.success(f"Created {len(results)} page images.")
-            st.download_button(
-                label=f"Download {Path(uploaded.name).stem} images (.zip)",
-                data=zip_bytes,
-                file_name=f"{safe_name(Path(uploaded.name).stem)}_images.zip",
-                mime="application/zip",
-                use_container_width=True,
+    for index, uploaded in enumerate(uploaded_files, start=1):
+        progress_text.caption(f"Processing {index} of {file_count}: {uploaded.name}")
+        try:
+            results, zip_bytes, previews = convert_pdf_bytes(
+                uploaded.getvalue(),
+                uploaded.name,
+                zoom=zoom,
             )
+            batch_outputs.append({
+                "original_name": uploaded.name,
+                "results": results,
+                "zip_bytes": zip_bytes,
+                "previews": previews,
+                "error": None,
+            })
+        except Exception as exc:
+            batch_outputs.append({
+                "original_name": uploaded.name,
+                "results": [],
+                "zip_bytes": b"",
+                "previews": [],
+                "error": str(exc),
+            })
+        progress_bar.progress(index / file_count)
 
-            with st.expander("See extracted filenames", expanded=True):
-                for item in results:
-                    st.write(f"Page {item['page']}: {item['filename']}")
+    st.session_state.conversion_outputs = batch_outputs
+    progress_bar.empty()
+    progress_text.empty()
 
-            if previews:
-                st.caption("Preview of first few generated images")
-                preview_cols = st.columns(min(3, len(previews)))
-                for idx, (name, img_bytes) in enumerate(previews):
-                    with preview_cols[idx % len(preview_cols)]:
+if st.session_state.conversion_outputs:
+    st.divider()
+    st.subheader("Your downloads")
+    st.caption("Each ZIP contains the renamed PNG pages from one source PDF.")
+
+    successful_outputs = sum(
+        output["error"] is None for output in st.session_state.conversion_outputs
+    )
+    if successful_outputs:
+        st.success(
+            f"Finished {successful_outputs} of "
+            f"{len(st.session_state.conversion_outputs)} PDF files."
+        )
+
+    for output_index, output in enumerate(st.session_state.conversion_outputs):
+        with st.container(border=True):
+            if output["error"]:
+                st.subheader(output["original_name"])
+                st.error(f"This PDF could not be processed: {output['error']}")
+                continue
+
+            result_col, download_col = st.columns([1.7, 1], vertical_alignment="center")
+            with result_col:
+                st.subheader(output["original_name"])
+                page_count = len(output["results"])
+                st.markdown(
+                    f'<div class="result-meta">{page_count} PNG page'
+                    f'{"s" if page_count != 1 else ""} · '
+                    f'{format_file_size(len(output["zip_bytes"]))} ZIP</div>',
+                    unsafe_allow_html=True,
+                )
+            with download_col:
+                zip_name = f"{safe_name(Path(output['original_name']).stem)}_images.zip"
+                st.download_button(
+                    label="Download ZIP",
+                    data=output["zip_bytes"],
+                    file_name=zip_name,
+                    mime="application/zip",
+                    key=f"download_{output_index}_{zip_name}",
+                    use_container_width=True,
+                )
+
+            with st.expander(f"View all {page_count} filenames"):
+                for item in output["results"]:
+                    st.write(f"Page {item['page']}: `{item['filename']}`")
+
+            if output["previews"]:
+                st.caption("Preview of the first five pages")
+                preview_cols = st.columns(min(3, len(output["previews"])))
+                for preview_index, (name, img_bytes) in enumerate(output["previews"]):
+                    with preview_cols[preview_index % len(preview_cols)]:
                         st.image(img_bytes, caption=name, use_container_width=True)
