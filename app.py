@@ -54,8 +54,8 @@ def get_page_title(page: fitz.Page) -> str:
     return best_span[0] if best_span else ""
 
 
-def get_research_analyst(page: fitz.Page) -> str:
-    """Return the value printed next to or below the Research Analyst label."""
+def get_manager_name(page: fitz.Page) -> str:
+    """Return the value next to or below a supported manager label."""
     lines = [
         re.sub(r'\s+', ' ', line).strip()
         for line in page.get_text("text", sort=True).splitlines()
@@ -63,7 +63,11 @@ def get_research_analyst(page: fitz.Page) -> str:
     ]
 
     for index, line in enumerate(lines):
-        match = re.match(r'^research\s+analyst\b\s*[:\-]?\s*(.*)$', line, re.IGNORECASE)
+        match = re.match(
+            r'^(?:research\s+analyst|investment\s+advisor)\b\s*[:\-]?\s*(.*)$',
+            line,
+            re.IGNORECASE,
+        )
         if not match:
             continue
 
@@ -90,9 +94,9 @@ def convert_pdf_bytes(pdf_bytes: bytes, original_name: str, zoom: float = 2.0):
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
         for i, page in enumerate(doc, start=1):
             title_raw = get_page_title(page) or f"page_{i}"
-            analyst_raw = get_research_analyst(page)
+            manager_raw = get_manager_name(page)
 
-            display_name = f"{title_raw} by {analyst_raw}" if analyst_raw else title_raw
+            display_name = f"{title_raw} by {manager_raw}" if manager_raw else title_raw
             title = safe_name(display_name)
             image_path = unique_path(out_dir / f"{title}.png")
             pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
@@ -121,7 +125,7 @@ def convert_pdf_bytes(pdf_bytes: bytes, original_name: str, zoom: float = 2.0):
 
 
 st.title("PDF Pages to Images")
-st.write("Upload one or more PDF files. Every page is converted to a PNG image. When a Research Analyst is present, it is included in the filename.")
+st.write("Upload one or more PDF files. Every page is converted to a PNG image. When a Research Analyst or Investment Advisor is present, the name is included in the filename.")
 
 col1, col2 = st.columns([2, 1])
 with col1:

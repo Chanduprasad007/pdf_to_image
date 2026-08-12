@@ -3,10 +3,10 @@
 A simple Streamlit web app that:
 - uploads one or more PDF files
 - converts every PDF page into a PNG image
-- names pages with a Research Analyst in the format
-  `<title> by <research analyst>`
-- uses the detected page title (or `page_<number>`) when no Research Analyst is
-  present
+- names pages with a Research Analyst or Investment Advisor in the format
+  `<title> by <manager name>`
+- uses the detected page title (or `page_<number>`) when neither manager label
+  is present
 - creates a ZIP download per PDF
 
 ## Setup
