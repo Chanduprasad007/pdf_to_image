@@ -2,12 +2,15 @@
 
 A simple Streamlit web app that:
 - uploads and processes multiple PDF files in one batch
-- converts every PDF page into a PNG image
+- converts portfolio detail pages into PNG images
+- skips generic introduction, how-to, performance, and ending pages by only
+  including pages with a Research Analyst or Investment Advisor label
 - names pages with a Research Analyst or Investment Advisor in the format
   `<title> by <manager name>`
 - uses the detected page title (or `page_<number>`) when neither manager label
   is present
 - creates a separate ZIP download for every uploaded PDF
+- reports total, converted, and skipped page counts for each PDF
 
 ## Setup
 

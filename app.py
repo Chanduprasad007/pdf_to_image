@@ -30,6 +30,7 @@ st.markdown(
             --focus: var(--accent);
         }
 
+        html { color-scheme: light; }
         .stApp { background: var(--app-bg); color: var(--ink); }
         .block-container {
             max-width: 1080px;
@@ -88,23 +89,46 @@ st.markdown(
         h2, h3 { color: var(--ink); letter-spacing: -0.015em; }
         div[data-testid="stFileUploaderDropzone"] {
             min-height: 12rem;
-            border: 1.5px dashed var(--line);
+            border: 1.5px dashed var(--line) !important;
             border-radius: 0.9rem;
-            background: var(--surface);
+            background: var(--surface) !important;
+            color: var(--ink) !important;
             transition: border-color 180ms ease-out, background 180ms ease-out;
         }
         div[data-testid="stFileUploaderDropzone"]:hover {
-            border-color: var(--focus);
-            background: var(--surface-subtle);
+            border-color: var(--focus) !important;
+            background: var(--surface-subtle) !important;
         }
         div[data-testid="stFileUploaderDropzone"] button {
-            border-color: var(--line);
-            background: var(--surface);
-            color: var(--ink);
+            border-color: var(--primary) !important;
+            background: var(--primary) !important;
+            color: oklch(1 0 0) !important;
+            font-weight: 650;
+        }
+        div[data-testid="stFileUploaderDropzone"] button:hover {
+            border-color: var(--primary-hover) !important;
+            background: var(--primary-hover) !important;
+        }
+        div[data-testid="stFileUploaderDropzone"] button p,
+        div[data-testid="stFileUploaderDropzone"] button span {
+            color: oklch(1 0 0) !important;
+        }
+        div[data-testid="stFileUploaderDropzone"] button svg {
+            fill: oklch(1 0 0) !important;
+            color: oklch(1 0 0) !important;
+        }
+        div[data-testid="stFileUploaderDropzone"] small,
+        div[data-testid="stFileUploaderDropzone"] > div > span {
+            color: var(--muted) !important;
         }
         div[data-testid="stFileUploaderFile"] {
             border-radius: 0.65rem;
-            background: var(--surface);
+            background: var(--surface) !important;
+            color: var(--ink) !important;
+        }
+        div[data-testid="stSlider"] label,
+        div[data-testid="stSlider"] p {
+            color: var(--ink) !important;
         }
 
         div[data-testid="stButton"] > button[kind="primary"],
@@ -149,6 +173,15 @@ st.markdown(
         }
         div[data-testid="stImage"] img { border-radius: 0.55rem; }
         .result-meta { color: var(--muted); font-size: 0.9rem; }
+        .result-counts {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.5rem 1.15rem;
+            margin-top: 0.65rem;
+            color: var(--muted);
+            font-size: 0.9rem;
+        }
+        .result-counts strong { color: var(--ink); font-weight: 700; }
 
         @media (max-width: 640px) {
             .block-container { padding-top: 2rem; }
@@ -249,11 +282,18 @@ def convert_pdf_bytes(pdf_bytes: bytes, original_name: str, zoom: float = 2.0):
         out_dir.mkdir(parents=True, exist_ok=True)
 
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        total_pages = len(doc)
         for i, page in enumerate(doc, start=1):
-            title_raw = get_page_title(page) or f"page_{i}"
             manager_raw = get_manager_name(page)
 
-            display_name = f"{title_raw} by {manager_raw}" if manager_raw else title_raw
+            # Portfolio detail pages contain one of the supported manager
+            # labels. Generic cover, how-to, performance, and ending pages do
+            # not, so they are excluded from the output.
+            if not manager_raw:
+                continue
+
+            title_raw = get_page_title(page) or f"page_{i}"
+            display_name = f"{title_raw} by {manager_raw}"
             title = safe_name(display_name)
             image_path = unique_path(out_dir / f"{title}.png")
             pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
@@ -278,7 +318,7 @@ def convert_pdf_bytes(pdf_bytes: bytes, original_name: str, zoom: float = 2.0):
         for item in results[:5]:
             preview_images.append((item["filename"], item["path"].read_bytes()))
 
-        return results, zip_buffer.getvalue(), preview_images
+        return total_pages, results, zip_buffer.getvalue(), preview_images
 
 
 def format_file_size(size_bytes: int) -> str:
@@ -293,12 +333,12 @@ st.markdown(
         <div class="app-mark">PNG</div>
         <div>
             <h1>PDF page exporter</h1>
-            <p>Turn every page into a crisp PNG, automatically named using the page title and its Research Analyst or Investment Advisor.</p>
+            <p>Extract portfolio detail pages as crisp PNGs, automatically named using the title and its Research Analyst or Investment Advisor.</p>
         </div>
     </div>
     <div class="workflow-note" aria-label="Conversion steps">
         <span><strong>1.</strong> Select one or more PDFs</span>
-        <span><strong>2.</strong> Convert every page</span>
+        <span><strong>2.</strong> Keep manager-labelled pages</span>
         <span><strong>3.</strong> Download a separate ZIP for each PDF</span>
     </div>
     """,
@@ -306,7 +346,7 @@ st.markdown(
 )
 
 st.subheader("Upload PDFs")
-st.caption("Select multiple files in one go. Each PDF is processed independently.")
+st.caption("Select multiple files in one go. Generic introduction, how-to, performance, and ending pages are skipped.")
 uploaded_files = st.file_uploader(
     "Choose PDF files",
     type=["pdf"],
@@ -358,13 +398,14 @@ if process and uploaded_files:
     for index, uploaded in enumerate(uploaded_files, start=1):
         progress_text.caption(f"Processing {index} of {file_count}: {uploaded.name}")
         try:
-            results, zip_bytes, previews = convert_pdf_bytes(
+            total_pages, results, zip_bytes, previews = convert_pdf_bytes(
                 uploaded.getvalue(),
                 uploaded.name,
                 zoom=zoom,
             )
             batch_outputs.append({
                 "original_name": uploaded.name,
+                "total_pages": total_pages,
                 "results": results,
                 "zip_bytes": zip_bytes,
                 "previews": previews,
@@ -373,6 +414,7 @@ if process and uploaded_files:
         except Exception as exc:
             batch_outputs.append({
                 "original_name": uploaded.name,
+                "total_pages": 0,
                 "results": [],
                 "zip_bytes": b"",
                 "previews": [],
@@ -408,25 +450,37 @@ if st.session_state.conversion_outputs:
             result_col, download_col = st.columns([1.7, 1], vertical_alignment="center")
             with result_col:
                 st.subheader(output["original_name"])
-                page_count = len(output["results"])
+                converted_count = len(output["results"])
+                total_pages = output["total_pages"]
+                skipped_count = total_pages - converted_count
                 st.markdown(
-                    f'<div class="result-meta">{page_count} PNG page'
-                    f'{"s" if page_count != 1 else ""} · '
-                    f'{format_file_size(len(output["zip_bytes"]))} ZIP</div>',
+                    '<div class="result-counts">'
+                    f'<span><strong>{total_pages}</strong> total pages</span>'
+                    f'<span><strong>{converted_count}</strong> converted</span>'
+                    f'<span><strong>{skipped_count}</strong> skipped</span>'
+                    '</div>',
                     unsafe_allow_html=True,
                 )
             with download_col:
                 zip_name = f"{safe_name(Path(output['original_name']).stem)}_images.zip"
-                st.download_button(
-                    label="Download ZIP",
-                    data=output["zip_bytes"],
-                    file_name=zip_name,
-                    mime="application/zip",
-                    key=f"download_{output_index}_{zip_name}",
-                    use_container_width=True,
-                )
+                if converted_count:
+                    st.download_button(
+                        label="Download ZIP",
+                        data=output["zip_bytes"],
+                        file_name=zip_name,
+                        mime="application/zip",
+                        key=f"download_{output_index}_{zip_name}",
+                        use_container_width=True,
+                    )
 
-            with st.expander(f"View all {page_count} filenames"):
+            if not converted_count:
+                st.warning(
+                    "No portfolio pages with a Research Analyst or Investment Advisor "
+                    "were found in this PDF."
+                )
+                continue
+
+            with st.expander(f"View all {converted_count} filenames"):
                 for item in output["results"]:
                     st.write(f"Page {item['page']}: `{item['filename']}`")
 
