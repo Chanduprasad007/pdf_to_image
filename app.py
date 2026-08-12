@@ -89,15 +89,10 @@ def convert_pdf_bytes(pdf_bytes: bytes, original_name: str, zoom: float = 2.0):
 
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
         for i, page in enumerate(doc, start=1):
-            title_raw = get_page_title(page)
+            title_raw = get_page_title(page) or f"page_{i}"
             analyst_raw = get_research_analyst(page)
 
-            # Cover, welcome, instructions, and closing pages do not contain
-            # both pieces of smallcase information and should be skipped.
-            if not title_raw or not analyst_raw:
-                continue
-
-            display_name = f"{title_raw} by {analyst_raw}"
+            display_name = f"{title_raw} by {analyst_raw}" if analyst_raw else title_raw
             title = safe_name(display_name)
             image_path = unique_path(out_dir / f"{title}.png")
             pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
@@ -126,7 +121,7 @@ def convert_pdf_bytes(pdf_bytes: bytes, original_name: str, zoom: float = 2.0):
 
 
 st.title("PDF Pages to Images")
-st.write("Upload one or more PDF files. Pages containing both a smallcase title and Research Analyst are converted to PNG images; all other pages are skipped.")
+st.write("Upload one or more PDF files. Every page is converted to a PNG image. When a Research Analyst is present, it is included in the filename.")
 
 col1, col2 = st.columns([2, 1])
 with col1:
@@ -147,10 +142,6 @@ if process and uploaded_files:
             st.subheader(uploaded.name)
             with st.spinner(f"Processing {uploaded.name}..."):
                 results, zip_bytes, previews = convert_pdf_bytes(uploaded.getvalue(), uploaded.name, zoom=zoom)
-
-            if not results:
-                st.warning("No pages contained both a smallcase title and Research Analyst. No images were created.")
-                continue
 
             st.success(f"Created {len(results)} page images.")
             st.download_button(
