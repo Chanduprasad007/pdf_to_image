@@ -327,6 +327,37 @@ def format_file_size(size_bytes: int) -> str:
     return f"{size_bytes / (1024 * 1024):.1f} MB"
 
 
+def output_zip_name(original_name: str) -> str:
+    return f"{safe_name(Path(original_name).stem)}_images.zip"
+
+
+def create_batch_zip(outputs: list[dict]) -> bytes:
+    """Bundle each successful per-PDF ZIP into one download archive."""
+    batch_buffer = io.BytesIO()
+    used_names = {}
+
+    # The inner files are already compressed ZIPs, so storing them directly
+    # avoids wasting time trying to compress the same bytes again.
+    with zipfile.ZipFile(batch_buffer, "w", zipfile.ZIP_STORED) as archive:
+        for output in outputs:
+            if output["error"] is not None or not output["results"]:
+                continue
+
+            base_name = output_zip_name(output["original_name"])
+            used_names[base_name] = used_names.get(base_name, 0) + 1
+            occurrence = used_names[base_name]
+            if occurrence == 1:
+                archive_name = base_name
+            else:
+                zip_path = Path(base_name)
+                archive_name = f"{zip_path.stem} ({occurrence}){zip_path.suffix}"
+
+            archive.writestr(archive_name, output["zip_bytes"])
+
+    batch_buffer.seek(0)
+    return batch_buffer.getvalue()
+
+
 st.markdown(
     """
     <div class="app-hero">
@@ -346,7 +377,13 @@ st.markdown(
 )
 
 st.subheader("Upload PDFs")
-st.caption("Select multiple files in one go. Generic introduction, how-to, performance, and ending pages are skipped.")
+st.caption("Select multiple files in one go. Each PDF is processed independently.")
+st.info(
+    "**Pages skipped:** cover or welcome pages, how-to or instruction pages, "
+    "performance pages, disclaimers, and ending or thank-you pages. The app "
+    "exports only pages that contain a **Research Analyst** or "
+    "**Investment Advisor** label."
+)
 uploaded_files = st.file_uploader(
     "Choose PDF files",
     type=["pdf"],
@@ -429,16 +466,41 @@ if process and uploaded_files:
 if st.session_state.conversion_outputs:
     st.divider()
     st.subheader("Your downloads")
-    st.caption("Each ZIP contains the renamed PNG pages from one source PDF.")
+    st.caption(
+        "Download every PDF separately, or download one master ZIP containing "
+        "all the individual ZIP files."
+    )
 
     successful_outputs = sum(
         output["error"] is None for output in st.session_state.conversion_outputs
     )
-    if successful_outputs:
-        st.success(
-            f"Finished {successful_outputs} of "
-            f"{len(st.session_state.conversion_outputs)} PDF files."
-        )
+    downloadable_outputs = [
+        output
+        for output in st.session_state.conversion_outputs
+        if output["error"] is None and output["results"]
+    ]
+
+    summary_col, batch_download_col = st.columns(
+        [1.7, 1],
+        vertical_alignment="center",
+    )
+    with summary_col:
+        if successful_outputs:
+            st.success(
+                f"Finished {successful_outputs} of "
+                f"{len(st.session_state.conversion_outputs)} PDF files."
+            )
+    with batch_download_col:
+        if downloadable_outputs:
+            batch_zip_bytes = create_batch_zip(downloadable_outputs)
+            st.download_button(
+                label=f"Download all {len(downloadable_outputs)} ZIPs",
+                data=batch_zip_bytes,
+                file_name="all_pdf_image_zips.zip",
+                mime="application/zip",
+                key="download_all_zips",
+                use_container_width=True,
+            )
 
     for output_index, output in enumerate(st.session_state.conversion_outputs):
         with st.container(border=True):
@@ -462,7 +524,7 @@ if st.session_state.conversion_outputs:
                     unsafe_allow_html=True,
                 )
             with download_col:
-                zip_name = f"{safe_name(Path(output['original_name']).stem)}_images.zip"
+                zip_name = output_zip_name(output["original_name"])
                 if converted_count:
                     st.download_button(
                         label="Download ZIP",
