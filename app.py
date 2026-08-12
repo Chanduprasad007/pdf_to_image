@@ -1,11 +1,18 @@
 from pathlib import Path
+from datetime import datetime, timezone
 import re
 import io
 import zipfile
 import tempfile
+import time
 
 import fitz  # PyMuPDF
 import streamlit as st
+
+GOOGLE_DRIVE_SCOPE = "https://www.googleapis.com/auth/drive"
+GOOGLE_AUTHORIZE_URL = "https://accounts.google.com/o/oauth2/v2/auth"
+GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
+GOOGLE_REVOKE_URL = "https://oauth2.googleapis.com/revoke"
 
 st.set_page_config(
     page_title="PDF Page Exporter",
@@ -358,6 +365,346 @@ def create_batch_zip(outputs: list[dict]) -> bytes:
     return batch_buffer.getvalue()
 
 
+def get_google_drive_config():
+    """Read optional OAuth settings without breaking the core converter."""
+    try:
+        config = st.secrets["google_drive"]
+        required = ("client_id", "client_secret", "redirect_uri")
+        if not all(config.get(key) for key in required):
+            return None
+        return config
+    except (FileNotFoundError, KeyError):
+        return None
+
+
+def build_drive_service(token: dict, config):
+    from google.oauth2.credentials import Credentials
+    from googleapiclient.discovery import build
+
+    expiry = None
+    if token.get("expires_at"):
+        expiry = datetime.fromtimestamp(float(token["expires_at"]), timezone.utc)
+    elif token.get("expires_in") and token.get("obtained_at"):
+        expiry = datetime.fromtimestamp(
+            float(token["obtained_at"]) + float(token["expires_in"]),
+            timezone.utc,
+        )
+
+    credentials = Credentials(
+        token=token.get("access_token"),
+        refresh_token=token.get("refresh_token"),
+        token_uri=GOOGLE_TOKEN_URL,
+        client_id=config["client_id"],
+        client_secret=config["client_secret"],
+        scopes=[GOOGLE_DRIVE_SCOPE],
+        expiry=expiry,
+    )
+    return build("drive", "v3", credentials=credentials, cache_discovery=False)
+
+
+def list_drive_folders(service) -> list[dict]:
+    folders = []
+    page_token = None
+    while True:
+        response = service.files().list(
+            q=(
+                "mimeType = 'application/vnd.google-apps.folder' "
+                "and trashed = false"
+            ),
+            spaces="drive",
+            fields="nextPageToken, files(id, name)",
+            orderBy="name_natural",
+            pageSize=1000,
+            pageToken=page_token,
+        ).execute()
+        folders.extend(response.get("files", []))
+        page_token = response.get("nextPageToken")
+        if not page_token:
+            break
+    return folders
+
+
+def collect_converted_pngs(outputs: list[dict]) -> list[tuple[str, bytes]]:
+    """Flatten the latest successful conversions into unique PNG filenames."""
+    images = []
+    used_names = {}
+
+    for output in outputs:
+        if output["error"] is not None or not output["results"]:
+            continue
+        with zipfile.ZipFile(io.BytesIO(output["zip_bytes"])) as archive:
+            for member in archive.infolist():
+                if member.is_dir() or not member.filename.lower().endswith(".png"):
+                    continue
+
+                base_name = Path(member.filename).name
+                name_key = base_name.casefold()
+                used_names[name_key] = used_names.get(name_key, 0) + 1
+                occurrence = used_names[name_key]
+                if occurrence == 1:
+                    image_name = base_name
+                else:
+                    image_path = Path(base_name)
+                    image_name = (
+                        f"{image_path.stem} ({occurrence}){image_path.suffix}"
+                    )
+                images.append((image_name, archive.read(member)))
+
+    return images
+
+
+def list_folder_contents(service, folder_id: str) -> list[dict]:
+    contents = []
+    page_token = None
+    while True:
+        response = service.files().list(
+            q=f"'{folder_id}' in parents and trashed = false",
+            fields=(
+                "nextPageToken, files(id, name, "
+                "capabilities(canTrash))"
+            ),
+            pageSize=1000,
+            pageToken=page_token,
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True,
+        ).execute()
+        contents.extend(response.get("files", []))
+        page_token = response.get("nextPageToken")
+        if not page_token:
+            break
+    return contents
+
+
+def replace_drive_folder(service, folder_id: str, images: list[tuple[str, bytes]]):
+    """Replace a folder's direct contents, with best-effort rollback on error."""
+    from googleapiclient.http import MediaIoBaseUpload
+
+    folder = service.files().get(
+        fileId=folder_id,
+        fields="id, name, capabilities(canAddChildren)",
+        supportsAllDrives=True,
+    ).execute()
+    if not folder.get("capabilities", {}).get("canAddChildren", False):
+        raise PermissionError("You do not have permission to add files to this folder.")
+
+    existing_items = list_folder_contents(service, folder_id)
+    blocked_items = [
+        item["name"]
+        for item in existing_items
+        if not item.get("capabilities", {}).get("canTrash", False)
+    ]
+    if blocked_items:
+        sample = ", ".join(blocked_items[:3])
+        raise PermissionError(
+            "The folder contains items you cannot move to Trash: " + sample
+        )
+
+    uploaded_ids = []
+    trashed_ids = []
+    try:
+        # Upload first. If an upload fails, the old folder remains unchanged.
+        for image_name, image_bytes in images:
+            media = MediaIoBaseUpload(
+                io.BytesIO(image_bytes),
+                mimetype="image/png",
+                resumable=False,
+            )
+            created = service.files().create(
+                body={"name": image_name, "parents": [folder_id]},
+                media_body=media,
+                fields="id",
+                supportsAllDrives=True,
+            ).execute()
+            uploaded_ids.append(created["id"])
+
+        # All uploads succeeded; move the previous direct contents to Trash.
+        for item in existing_items:
+            service.files().update(
+                fileId=item["id"],
+                body={"trashed": True},
+                fields="id",
+                supportsAllDrives=True,
+            ).execute()
+            trashed_ids.append(item["id"])
+    except Exception:
+        # Restore any old items already moved, and remove partial new uploads.
+        for file_id in trashed_ids:
+            try:
+                service.files().update(
+                    fileId=file_id,
+                    body={"trashed": False},
+                    fields="id",
+                    supportsAllDrives=True,
+                ).execute()
+            except Exception:
+                pass
+        for file_id in uploaded_ids:
+            try:
+                service.files().update(
+                    fileId=file_id,
+                    body={"trashed": True},
+                    fields="id",
+                    supportsAllDrives=True,
+                ).execute()
+            except Exception:
+                pass
+        raise
+
+    return folder["name"], len(existing_items), len(uploaded_ids)
+
+
+def render_drive_sidebar(outputs: list[dict]):
+    with st.sidebar:
+        st.header("Google Drive sync")
+        st.caption(
+            "Replace one Drive folder with the PNGs from your latest conversion."
+        )
+
+        images = collect_converted_pngs(outputs)
+        if not images:
+            st.info("Convert at least one eligible PDF page to enable Drive sync.")
+            return
+
+        config = get_google_drive_config()
+        if config is None:
+            st.warning(
+                "Drive sync is not configured yet. Add the `[google_drive]` "
+                "credentials in your Streamlit app secrets."
+            )
+            return
+
+        try:
+            from streamlit_oauth import OAuth2Component
+        except ImportError:
+            st.error("Drive sync dependencies are not installed yet.")
+            return
+
+        oauth = OAuth2Component(
+            config["client_id"],
+            config["client_secret"],
+            GOOGLE_AUTHORIZE_URL,
+            GOOGLE_TOKEN_URL,
+            GOOGLE_TOKEN_URL,
+            GOOGLE_REVOKE_URL,
+        )
+
+        if "google_drive_token" not in st.session_state:
+            result = oauth.authorize_button(
+                "Connect Google Drive",
+                config["redirect_uri"],
+                GOOGLE_DRIVE_SCOPE,
+                key="google_drive_oauth",
+                use_container_width=True,
+                extras_params={
+                    "access_type": "offline",
+                    "prompt": "consent",
+                    "include_granted_scopes": "true",
+                },
+            )
+            if result and result.get("token"):
+                token = dict(result["token"])
+                token["obtained_at"] = time.time()
+                st.session_state.google_drive_token = token
+                st.session_state.pop("google_drive_folders", None)
+                st.rerun()
+            return
+
+        disconnect_col, refresh_col = st.columns(2)
+        with disconnect_col:
+            if st.button("Disconnect", use_container_width=True):
+                try:
+                    oauth.revoke_token(st.session_state.google_drive_token)
+                except Exception:
+                    pass
+                st.session_state.pop("google_drive_token", None)
+                st.session_state.pop("google_drive_folders", None)
+                st.session_state.pop("drive_sync_confirm", None)
+                st.rerun()
+        with refresh_col:
+            refresh_folders = st.button("Refresh folders", use_container_width=True)
+
+        try:
+            previous_token = st.session_state.google_drive_token
+            refreshed_token = oauth.refresh_token(previous_token)
+            if refreshed_token:
+                refreshed_token = dict(refreshed_token)
+                if not refreshed_token.get("refresh_token"):
+                    refreshed_token["refresh_token"] = previous_token.get(
+                        "refresh_token"
+                    )
+                if refreshed_token.get("access_token") != previous_token.get(
+                    "access_token"
+                ):
+                    refreshed_token["obtained_at"] = time.time()
+                else:
+                    refreshed_token["obtained_at"] = previous_token.get(
+                        "obtained_at",
+                        time.time(),
+                    )
+                st.session_state.google_drive_token = refreshed_token
+            service = build_drive_service(
+                st.session_state.google_drive_token,
+                config,
+            )
+            if refresh_folders or "google_drive_folders" not in st.session_state:
+                st.session_state.google_drive_folders = list_drive_folders(service)
+        except Exception as exc:
+            st.error(f"Google Drive connection failed: {exc}")
+            if st.button("Reconnect Drive", use_container_width=True):
+                st.session_state.pop("google_drive_token", None)
+                st.session_state.pop("google_drive_folders", None)
+                st.rerun()
+            return
+
+        folders = st.session_state.google_drive_folders
+        if not folders:
+            st.warning("No Google Drive folders were found for this account.")
+            return
+
+        folder_labels = {
+            folder["id"]: f"{folder['name']} · {folder['id'][-6:]}"
+            for folder in folders
+        }
+        selected_folder_id = st.selectbox(
+            "Destination folder",
+            options=[folder["id"] for folder in folders],
+            format_func=lambda folder_id: folder_labels[folder_id],
+            help="The final six characters help distinguish folders with the same name.",
+        )
+
+        st.warning(
+            f"Sync will move every existing item directly inside this folder to "
+            f"Google Drive Trash, then upload {len(images)} fresh PNG files. "
+            "The selected folder itself is not deleted."
+        )
+        confirmed = st.checkbox(
+            "I understand that the folder's current contents will be replaced.",
+            key="drive_sync_confirm",
+        )
+        sync_clicked = st.button(
+            f"Replace folder with {len(images)} PNGs",
+            type="primary",
+            disabled=not confirmed,
+            use_container_width=True,
+        )
+
+        if sync_clicked:
+            with st.spinner("Replacing the Drive folder contents..."):
+                try:
+                    folder_name, removed_count, uploaded_count = replace_drive_folder(
+                        service,
+                        selected_folder_id,
+                        images,
+                    )
+                except Exception as exc:
+                    st.error(f"Drive sync failed: {exc}")
+                else:
+                    st.success(
+                        f"Synced {uploaded_count} PNGs to “{folder_name}”. "
+                        f"Moved {removed_count} previous items to Trash."
+                    )
+
+
 st.markdown(
     """
     <div class="app-hero">
@@ -468,7 +815,7 @@ if st.session_state.conversion_outputs:
     st.subheader("Your downloads")
     st.caption(
         "Download every PDF separately, or download one master ZIP containing "
-        "all the individual ZIP files."
+        "all the individual ZIP files. Google Drive sync is available in the sidebar."
     )
 
     successful_outputs = sum(
@@ -552,3 +899,5 @@ if st.session_state.conversion_outputs:
                 for preview_index, (name, img_bytes) in enumerate(output["previews"]):
                     with preview_cols[preview_index % len(preview_cols)]:
                         st.image(img_bytes, caption=name, use_container_width=True)
+
+render_drive_sidebar(st.session_state.conversion_outputs)
