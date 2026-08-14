@@ -184,6 +184,23 @@ st.markdown(
             border-radius: 0.65rem;
         }
         div[data-testid="stImage"] img { border-radius: 0.55rem; }
+        .removed-image-slot {
+            display: grid;
+            place-items: center;
+            width: 100%;
+            min-height: 11rem;
+            aspect-ratio: 0.707;
+            border: 1px dashed var(--line);
+            border-radius: 0.55rem;
+            background: var(--surface-subtle);
+            color: var(--muted);
+            text-align: center;
+        }
+        .removed-image-slot strong {
+            display: block;
+            margin-bottom: 0.25rem;
+            color: var(--ink);
+        }
         .result-meta { color: var(--muted); font-size: 0.9rem; }
         .result-counts {
             display: flex;
@@ -428,48 +445,43 @@ def render_page_review(output: dict, output_index: int):
 
         if not kept_items:
             st.info(
-                "No images are currently selected. Restore an image below to "
+                "No images are currently selected. Restore an image to "
                 "enable download and Drive sync."
             )
 
+        # Render every page in its original grid position. Keeping stable
+        # element positions prevents Streamlit from reusing a deleted page's
+        # thumbnail for the next page during reruns.
         review_columns = st.columns(3)
-        for item_index, item in enumerate(kept_items):
+        for item_index, item in enumerate(output["results"]):
             with review_columns[item_index % len(review_columns)]:
-                st.image(
-                    item["image_bytes"],
-                    caption=f"Page {item['page']} · {item['filename']}",
-                    use_container_width=True,
-                )
                 selection_key = page_selection_key(
                     output,
                     output_index,
                     item["page"],
                 )
-                if st.button(
-                    f"Delete page {item['page']}",
-                    icon=":material/delete:",
-                    key=f"delete_{selection_key}",
-                    use_container_width=True,
-                ):
-                    st.session_state[selection_key] = False
-                    st.rerun()
-
-        if removed_items:
-            st.divider()
-            st.markdown(f"**Removed images ({len(removed_items)})**")
-            st.caption("Removed images are excluded from download and Drive sync.")
-            removed_columns = st.columns(3)
-            for item_index, item in enumerate(removed_items):
-                with removed_columns[item_index % len(removed_columns)]:
-                    st.image(
+                image_slot = st.empty()
+                if st.session_state[selection_key]:
+                    image_slot.image(
                         item["image_bytes"],
                         caption=f"Page {item['page']} · {item['filename']}",
                         use_container_width=True,
                     )
-                    selection_key = page_selection_key(
-                        output,
-                        output_index,
-                        item["page"],
+                    if st.button(
+                        f"Delete page {item['page']}",
+                        icon=":material/delete:",
+                        key=f"delete_{selection_key}",
+                        use_container_width=True,
+                    ):
+                        st.session_state[selection_key] = False
+                        st.rerun()
+                else:
+                    image_slot.markdown(
+                        '<div class="removed-image-slot">'
+                        '<div><strong>Image removed</strong>'
+                        f'<span>Page {item["page"]} is excluded from output</span></div>'
+                        '</div>',
+                        unsafe_allow_html=True,
                     )
                     if st.button(
                         f"Restore page {item['page']}",
