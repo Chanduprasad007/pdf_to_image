@@ -7,11 +7,14 @@ A simple Streamlit web app that:
   `<title> by <manager name>`
 - supports the newer one-pager layout by reading the smallcase name from the
   upper-left panel and the legal manager company below the lower-right SEBI area
-- uses cropped OCR when a PDF page is image-only and has no searchable text
+- OCRs the original embedded page image at native resolution when a PDF page
+  has no searchable text, with enlarged high-contrast title and manager regions
 - removes `Private Limited`, `Private Ltd`, and `Pvt Ltd` from manager names
 - names pages without a manager label using the detected page title
 - gives every image a bin button so unwanted pages can be removed before
   download or sync, with a restore option for accidental removal
+- provides an editable filename below every retained thumbnail for quick manual
+  correction before download or Drive sync
 - loads six lightweight review thumbnails at a time to keep large PDFs responsive
 - stores full-resolution PNGs and generated ZIPs on Streamlit's temporary disk
   instead of retaining them in session memory

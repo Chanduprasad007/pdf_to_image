@@ -1,5 +1,6 @@
 from pathlib import Path
 from datetime import datetime
+from io import BytesIO
 import re
 import zipfile
 import time
@@ -432,6 +433,81 @@ def render_ocr_crop(page: fitz.Page, clip: fitz.Rect, target_width: int = 950):
         del pix
 
 
+def get_native_page_image(page: fitz.Page):
+    """Return the largest embedded page image without rasterizing it again."""
+    from PIL import Image
+
+    candidates = sorted(
+        page.get_images(full=True),
+        key=lambda item: item[2] * item[3],
+        reverse=True,
+    )
+    if not candidates:
+        return None
+
+    xref, _smask, image_width, image_height = candidates[0][:4]
+    if image_width < 600 or image_height < 600:
+        return None
+    image_info = page.parent.extract_image(xref)
+    with Image.open(BytesIO(image_info["image"])) as source:
+        return source.convert("RGB")
+
+
+def get_ocr_region(
+    page: fitz.Page,
+    relative_box: tuple[float, float, float, float],
+    minimum_width: int,
+    native_image=None,
+):
+    """Crop and enhance a normalized region from the native page image."""
+    from PIL import Image, ImageOps
+
+    owns_native_image = native_image is None
+    if owns_native_image:
+        try:
+            native_image = get_native_page_image(page)
+        except Exception:
+            native_image = None
+
+    if native_image is not None:
+        left, top, right, bottom = relative_box
+        crop = native_image.crop((
+            round(native_image.width * left),
+            round(native_image.height * top),
+            round(native_image.width * right),
+            round(native_image.height * bottom),
+        ))
+        if owns_native_image:
+            native_image.close()
+    else:
+        width = page.rect.width
+        height = page.rect.height
+        left, top, right, bottom = relative_box
+        crop = render_ocr_crop(
+            page,
+            fitz.Rect(
+                width * left,
+                height * top,
+                width * right,
+                height * bottom,
+            ),
+            target_width=minimum_width,
+        )
+
+    if crop.width < minimum_width:
+        scale = minimum_width / max(crop.width, 1)
+        resized = crop.resize(
+            (minimum_width, round(crop.height * scale)),
+            Image.Resampling.LANCZOS,
+        )
+        crop.close()
+        crop = resized
+
+    enhanced = ImageOps.autocontrast(ImageOps.grayscale(crop), cutoff=1)
+    crop.close()
+    return ImageOps.expand(enhanced, border=24, fill="white")
+
+
 def ensure_ocr_available():
     """Fail clearly when Streamlit did not install the OCR dependencies."""
     try:
@@ -446,16 +522,16 @@ def ensure_ocr_available():
         ) from exc
 
 
-def get_ocr_title(page: fitz.Page) -> str:
+def get_ocr_title(page: fitz.Page, native_image=None) -> str:
     """OCR the upper-left title and select its largest contiguous line group."""
     import pytesseract
     from pytesseract import Output
 
-    width = page.rect.width
-    height = page.rect.height
-    image = render_ocr_crop(
+    image = get_ocr_region(
         page,
-        fitz.Rect(0, height * 0.12, width * 0.36, height * 0.34),
+        (0.02, 0.12, 0.36, 0.35),
+        minimum_width=1700,
+        native_image=native_image,
     )
     try:
         data = pytesseract.image_to_data(
@@ -550,16 +626,15 @@ def extract_manager_from_ocr_text(text: str) -> str:
     return company_before_description(text)
 
 
-def get_ocr_manager(page: fitz.Page) -> str:
+def get_ocr_manager(page: fitz.Page, native_image=None) -> str:
     """OCR the manager/company description beneath the lower-right SEBI area."""
     import pytesseract
 
-    width = page.rect.width
-    height = page.rect.height
-    image = render_ocr_crop(
+    image = get_ocr_region(
         page,
-        fitz.Rect(width * 0.38, height * 0.78, width, height * 0.93),
-        target_width=1200,
+        (0.40, 0.80, 0.97, 0.93),
+        minimum_width=2400,
+        native_image=native_image,
     )
     try:
         text = pytesseract.image_to_string(image, config="--psm 6")
@@ -571,13 +646,19 @@ def get_ocr_manager(page: fitz.Page) -> str:
 def get_ocr_page_identity(page: fitz.Page) -> tuple[str, str]:
     """Return OCR title and manager, degrading safely if OCR is unavailable."""
     try:
-        title = get_ocr_title(page)
+        native_image = get_native_page_image(page)
+    except Exception:
+        native_image = None
+    try:
+        title = get_ocr_title(page, native_image=native_image)
     except Exception:
         title = ""
     try:
-        manager = get_ocr_manager(page)
+        manager = get_ocr_manager(page, native_image=native_image)
     except Exception:
         manager = ""
+    if native_image is not None:
+        native_image.close()
     return title, manager
 
 
@@ -703,7 +784,9 @@ def output_zip_name(original_name: str) -> str:
 
 def build_output_zip(output: dict, results: list[dict]) -> str:
     """Build or reuse a disk-backed ZIP containing the selected pages."""
-    signature = ",".join(str(item["page"]) for item in results)
+    signature = "|".join(
+        f"{item['page']}:{item['filename']}" for item in results
+    )
     zip_path = Path(output["working_dir"]) / "selected_images.zip"
     if output.get("zip_signature") == signature and zip_path.exists():
         return str(zip_path)
@@ -721,6 +804,34 @@ def build_output_zip(output: dict, results: list[dict]) -> str:
 def page_selection_key(output: dict, output_index: int, page: int) -> str:
     batch_id = output.get("batch_id", "current")
     return f"keep_page_{batch_id}_{output_index}_{page}"
+
+
+def page_rename_key(output: dict, output_index: int, page: int) -> str:
+    batch_id = output.get("batch_id", "current")
+    return f"rename_page_{batch_id}_{output_index}_{page}"
+
+
+def apply_page_rename(
+    output: dict,
+    item: dict,
+    rename_key: str,
+):
+    """Apply a safe, unique PNG filename entered in the review screen."""
+    requested = str(st.session_state.get(rename_key, "")).strip()
+    requested = re.sub(r"\.png$", "", requested, flags=re.IGNORECASE)
+    requested = safe_name(requested)
+    candidate = f"{requested}.png"
+    existing_names = {
+        other["filename"].casefold()
+        for other in output["results"]
+        if other["page"] != item["page"]
+    }
+    if candidate.casefold() in existing_names:
+        candidate = f"{requested} (page {item['page']}).png"
+        st.session_state[rename_key] = Path(candidate).stem
+    item["filename"] = candidate
+    item["title"] = Path(candidate).stem
+    output["zip_signature"] = None
 
 
 def selected_output(output: dict, output_index: int) -> dict:
@@ -840,6 +951,23 @@ def render_page_review(output: dict, output_index: int):
                         item["thumbnail_path"],
                         caption=f"Page {item['page']} · {item['filename']}",
                         use_container_width=True,
+                    )
+                    rename_key = page_rename_key(
+                        output,
+                        output_index,
+                        item["page"],
+                    )
+                    if rename_key not in st.session_state:
+                        st.session_state[rename_key] = Path(
+                            item["filename"]
+                        ).stem
+                    st.text_input(
+                        f"Filename for page {item['page']}",
+                        key=rename_key,
+                        on_change=apply_page_rename,
+                        args=(output, item, rename_key),
+                        help="Edit the detected name if OCR needs correction. "
+                        "The .png extension is added automatically.",
                     )
                     if st.button(
                         f"Delete page {item['page']}",
@@ -1318,7 +1446,7 @@ st.markdown(
     </div>
     <div class="workflow-note" aria-label="Conversion steps">
         <span><strong>1.</strong> Select one or more PDFs</span>
-        <span><strong>2.</strong> Delete unwanted images</span>
+        <span><strong>2.</strong> Review, rename, or delete images</span>
         <span><strong>3.</strong> Download or sync the pages you keep</span>
     </div>
     """,
@@ -1330,8 +1458,8 @@ st.caption("Select multiple files in one go. Each PDF is processed independently
 st.info(
     "**Every page is converted.** The app supports both one-pager layouts and "
     "names portfolio pages `Smallcase by Manager`; all other pages use their "
-    "detected page title. After conversion, use the bin button to remove images "
-    "you do not want."
+    "detected page title. After conversion, you can correct any filename or use "
+    "the bin button to remove images you do not want."
 )
 uploaded_files = st.file_uploader(
     "Choose PDF files",
