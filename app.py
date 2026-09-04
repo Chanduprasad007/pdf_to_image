@@ -278,6 +278,13 @@ LEGAL_ENTITY_SUFFIX = (
 def extract_legal_entity_name(text: str) -> str:
     """Extract a company name ending in a common Indian legal suffix."""
     normalized = re.sub(r"\s+", " ", text).strip()
+    normalized = re.sub(r"^[^A-Za-z0-9]+", "", normalized)
+    normalized = re.sub(
+        r"^(?:portfolio\s+manager|manager|managed\s+by)\s*[:\-]\s*",
+        "",
+        normalized,
+        flags=re.IGNORECASE,
+    )
     match = re.match(
         rf"^([A-Z][A-Za-z0-9&'().,\-]*(?:\s+[A-Za-z0-9&'().,\-]+){{0,10}}?"
         rf"\s+{LEGAL_ENTITY_SUFFIX})(?=\s|,|$)",
@@ -304,7 +311,7 @@ def get_lower_right_legal_manager(page: fitz.Page) -> str:
 
     for block in page.get_text("blocks", sort=True):
         x0, y0, _x1, _y1, text = block[:5]
-        if x0 < width * 0.32 or y0 < height * 0.62 or y0 > height * 0.95:
+        if x0 < width * 0.22 or y0 < height * 0.55 or y0 > height * 0.96:
             continue
         candidate_blocks.append((y0, text))
 
@@ -325,52 +332,74 @@ def get_upper_left_title(page: fitz.Page) -> str:
     """Read the prominent multi-line smallcase title in the new left panel."""
     width = page.rect.width
     height = page.rect.height
-    candidate_blocks = []
+    candidate_lines = []
 
     for block in page.get_text("dict").get("blocks", []):
         lines = block.get("lines", [])
         if not lines:
             continue
-        x0, y0, x1, y1 = block.get("bbox", (0, 0, 0, 0))
-        if x0 > width * 0.38 or x1 > width * 0.48:
-            continue
-        if y0 < height * 0.12 or y0 > height * 0.38:
-            continue
-
-        line_values = []
-        max_size = 0.0
         for line in lines:
+            spans = line.get("spans", [])
             line_text = " ".join(
                 span.get("text", "").strip()
-                for span in line.get("spans", [])
+                for span in spans
                 if span.get("text", "").strip()
             )
             if not line_text:
                 continue
+            line_bbox = line.get("bbox")
+            if line_bbox is None and spans:
+                span_boxes = [
+                    span.get("bbox") for span in spans if span.get("bbox")
+                ]
+                if span_boxes:
+                    line_bbox = (
+                        min(box[0] for box in span_boxes),
+                        min(box[1] for box in span_boxes),
+                        max(box[2] for box in span_boxes),
+                        max(box[3] for box in span_boxes),
+                    )
+            if line_bbox is None:
+                continue
+
+            x0, y0, x1, y1 = line_bbox
+            if x0 > width * 0.38 or x1 > width * 0.52:
+                continue
+            if y0 < height * 0.12 or y0 > height * 0.42:
+                continue
             line_size = max(
-                (span.get("size", 0.0) for span in line.get("spans", [])),
+                (span.get("size", 0.0) for span in spans),
                 default=0.0,
             )
-            max_size = max(max_size, line_size)
-            line_values.append((line_text, line_size))
+            if line_size >= 12.0:
+                candidate_lines.append((y0, y1, line_size, line_text))
 
-        if line_values:
-            candidate_blocks.append((max_size, y0, line_values))
-
-    if not candidate_blocks:
+    if not candidate_lines:
         return ""
 
-    _max_size, _y0, best_lines = max(
-        candidate_blocks,
-        key=lambda candidate: (candidate[0], -candidate[1]),
+    clusters = []
+    for candidate in sorted(candidate_lines):
+        y0, _y1, size, _text = candidate
+        if not clusters:
+            clusters.append([candidate])
+            continue
+        previous = clusters[-1][-1]
+        max_gap = max(14.0, max(previous[2], size) * 1.25)
+        if y0 - previous[1] <= max_gap:
+            clusters[-1].append(candidate)
+        else:
+            clusters.append([candidate])
+
+    best_cluster = max(
+        clusters,
+        key=lambda cluster: (
+            len(cluster),
+            sum(item[2] for item in cluster) / len(cluster),
+            sum(len(item[3]) for item in cluster),
+            -cluster[0][0],
+        ),
     )
-    prominent_size = max(size for _text, size in best_lines)
-    title_lines = [
-        text
-        for text, size in best_lines
-        if size >= max(10.0, prominent_size * 0.78)
-    ]
-    return " ".join(title_lines).strip()
+    return " ".join(item[3] for item in best_cluster).strip()
 
 
 def get_manager_name(page: fitz.Page) -> str:
