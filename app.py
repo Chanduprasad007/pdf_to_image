@@ -258,6 +258,110 @@ def get_page_title(page: fitz.Page) -> str:
     return best_span[0] if best_span else ""
 
 
+LEGAL_ENTITY_SUFFIX = (
+    r"(?:Private\s+(?:Limited|Ltd\.?)|Pvt\.?\s+Ltd\.?|"
+    r"Limited|Ltd\.?|LLP|L\.L\.P\.?)"
+)
+
+
+def extract_legal_entity_name(text: str) -> str:
+    """Extract a company name ending in a common Indian legal suffix."""
+    normalized = re.sub(r"\s+", " ", text).strip()
+    match = re.match(
+        rf"^([A-Z][A-Za-z0-9&'().,\-]*(?:\s+[A-Za-z0-9&'().,\-]+){{0,10}}?"
+        rf"\s+{LEGAL_ENTITY_SUFFIX})(?=\s|,|$)",
+        normalized,
+        re.IGNORECASE,
+    )
+    if not match:
+        return ""
+    manager_name = match.group(1).strip().rstrip(".,")
+    manager_name = re.sub(
+        r"\s+(?:Private\s+(?:Limited|Ltd\.?)|Pvt\.?\s+Ltd\.?)$",
+        "",
+        manager_name,
+        flags=re.IGNORECASE,
+    )
+    return manager_name.strip().rstrip(".,")
+
+
+def get_lower_right_legal_manager(page: fitz.Page) -> str:
+    """Find the legal manager name beneath the SEBI area in the new layout."""
+    width = page.rect.width
+    height = page.rect.height
+    candidate_blocks = []
+
+    for block in page.get_text("blocks", sort=True):
+        x0, y0, _x1, _y1, text = block[:5]
+        if x0 < width * 0.32 or y0 < height * 0.62 or y0 > height * 0.95:
+            continue
+        candidate_blocks.append((y0, text))
+
+    for _y0, text in sorted(candidate_blocks):
+        # The company description normally starts with the legal entity name.
+        for line in text.splitlines():
+            manager = extract_legal_entity_name(line)
+            if manager:
+                return manager
+        manager = extract_legal_entity_name(text)
+        if manager:
+            return manager
+
+    return ""
+
+
+def get_upper_left_title(page: fitz.Page) -> str:
+    """Read the prominent multi-line smallcase title in the new left panel."""
+    width = page.rect.width
+    height = page.rect.height
+    candidate_blocks = []
+
+    for block in page.get_text("dict").get("blocks", []):
+        lines = block.get("lines", [])
+        if not lines:
+            continue
+        x0, y0, x1, y1 = block.get("bbox", (0, 0, 0, 0))
+        if x0 > width * 0.38 or x1 > width * 0.48:
+            continue
+        if y0 < height * 0.12 or y0 > height * 0.38:
+            continue
+
+        line_values = []
+        max_size = 0.0
+        for line in lines:
+            line_text = " ".join(
+                span.get("text", "").strip()
+                for span in line.get("spans", [])
+                if span.get("text", "").strip()
+            )
+            if not line_text:
+                continue
+            line_size = max(
+                (span.get("size", 0.0) for span in line.get("spans", [])),
+                default=0.0,
+            )
+            max_size = max(max_size, line_size)
+            line_values.append((line_text, line_size))
+
+        if line_values:
+            candidate_blocks.append((max_size, y0, line_values))
+
+    if not candidate_blocks:
+        return ""
+
+    _max_size, _y0, best_lines = max(
+        candidate_blocks,
+        key=lambda candidate: (candidate[0], -candidate[1]),
+    )
+    prominent_size = max(size for _text, size in best_lines)
+    title_lines = [
+        text
+        for text, size in best_lines
+        if size >= max(10.0, prominent_size * 0.78)
+    ]
+    return " ".join(title_lines).strip()
+
+
 def get_manager_name(page: fitz.Page) -> str:
     """Return the value next to or below a supported manager label."""
     lines = [
@@ -301,8 +405,12 @@ def convert_pdf_bytes(
     try:
         total_pages = len(doc)
         for i, page in enumerate(doc, start=1):
-            manager_raw = get_manager_name(page)
-            title_raw = get_page_title(page) or f"Page {i:03d}"
+            legal_manager = get_lower_right_legal_manager(page)
+            manager_raw = legal_manager or get_manager_name(page)
+            title_raw = (
+                get_upper_left_title(page) if legal_manager else get_page_title(page)
+            )
+            title_raw = title_raw or get_page_title(page) or f"Page {i:03d}"
             display_name = (
                 f"{title_raw} by {manager_raw}" if manager_raw else title_raw
             )
@@ -971,9 +1079,10 @@ st.markdown(
 st.subheader("Upload PDFs")
 st.caption("Select multiple files in one go. Each PDF is processed independently.")
 st.info(
-    "**Every page is converted.** Pages with a Research Analyst or Investment "
-    "Advisor are named `Title by Manager`; all other pages use their detected "
-    "page title. After conversion, use the bin button to remove images you do not want."
+    "**Every page is converted.** The app supports both one-pager layouts and "
+    "names portfolio pages `Smallcase by Manager`; all other pages use their "
+    "detected page title. After conversion, use the bin button to remove images "
+    "you do not want."
 )
 uploaded_files = st.file_uploader(
     "Choose PDF files",
