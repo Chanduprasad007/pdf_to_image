@@ -7,6 +7,7 @@ A simple Streamlit web app that:
   `<title> by <manager name>`
 - supports the newer one-pager layout by reading the smallcase name from the
   upper-left panel and the legal manager company below the lower-right SEBI area
+- uses cropped OCR when a PDF page is image-only and has no searchable text
 - removes `Private Limited`, `Private Ltd`, and `Pvt Ltd` from manager names
 - names pages without a manager label using the detected page title
 - gives every image a bin button so unwanted pages can be removed before
@@ -21,6 +22,10 @@ A simple Streamlit web app that:
   selected broker subfolder with one report's freshly converted PNGs
 
 ## Setup
+
+The app needs both the Python packages in `requirements.txt` and the Tesseract
+system package in `packages.txt`. Streamlit Community Cloud installs both files
+automatically when they are committed at the repository root.
 
 ```bash
 cd /path/to/pdf_to_image-main

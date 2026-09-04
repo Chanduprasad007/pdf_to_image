@@ -274,6 +274,14 @@ LEGAL_ENTITY_SUFFIX = (
     r"Limited|Ltd\.?|LLP|L\.L\.P\.?)"
 )
 
+OUTPUT_WIDTHS = {
+    1.0: 1000,
+    1.5: 1400,
+    2.0: 1800,
+    2.5: 2200,
+    3.0: 2600,
+}
+
 
 def extract_legal_entity_name(text: str) -> str:
     """Extract a company name ending in a common Indian legal suffix."""
@@ -402,6 +410,177 @@ def get_upper_left_title(page: fitz.Page) -> str:
     return " ".join(item[3] for item in best_cluster).strip()
 
 
+def pixmap_to_pil_image(pix):
+    """Convert a small OCR pixmap to a Pillow image."""
+    from PIL import Image
+
+    mode = "RGBA" if pix.alpha else "RGB"
+    return Image.frombytes(mode, (pix.width, pix.height), pix.samples)
+
+
+def render_ocr_crop(page: fitz.Page, clip: fitz.Rect, target_width: int = 950):
+    """Render only a small page region at an OCR-friendly resolution."""
+    scale = max(0.5, min(3.0, target_width / max(clip.width, 1)))
+    pix = page.get_pixmap(
+        matrix=fitz.Matrix(scale, scale),
+        clip=clip,
+        alpha=False,
+    )
+    try:
+        return pixmap_to_pil_image(pix)
+    finally:
+        del pix
+
+
+def ensure_ocr_available():
+    """Fail clearly when Streamlit did not install the OCR dependencies."""
+    try:
+        import pytesseract
+
+        pytesseract.get_tesseract_version()
+    except Exception as exc:
+        raise RuntimeError(
+            "This PDF contains image-only pages, but OCR is unavailable. "
+            "Commit both requirements.txt and packages.txt to the repository "
+            "root, then reboot the Streamlit app."
+        ) from exc
+
+
+def get_ocr_title(page: fitz.Page) -> str:
+    """OCR the upper-left title and select its largest contiguous line group."""
+    import pytesseract
+    from pytesseract import Output
+
+    width = page.rect.width
+    height = page.rect.height
+    image = render_ocr_crop(
+        page,
+        fitz.Rect(0, height * 0.12, width * 0.36, height * 0.34),
+    )
+    try:
+        data = pytesseract.image_to_data(
+            image,
+            config="--psm 6",
+            output_type=Output.DICT,
+        )
+    finally:
+        image.close()
+
+    grouped_lines = {}
+    for index, word in enumerate(data.get("text", [])):
+        word = word.strip()
+        try:
+            confidence = float(data["conf"][index])
+        except (TypeError, ValueError):
+            confidence = -1
+        if not word or confidence < 20:
+            continue
+        key = (
+            data["block_num"][index],
+            data["par_num"][index],
+            data["line_num"][index],
+        )
+        grouped_lines.setdefault(key, []).append({
+            "text": word,
+            "top": data["top"][index],
+            "height": data["height"][index],
+        })
+
+    lines = []
+    for words in grouped_lines.values():
+        lines.append({
+            "text": " ".join(word["text"] for word in words),
+            "top": min(word["top"] for word in words),
+            "height": max(word["height"] for word in words),
+        })
+    if not lines:
+        return ""
+
+    largest_height = max(line["height"] for line in lines)
+    prominent = [
+        line for line in lines if line["height"] >= largest_height * 0.68
+    ]
+    clusters = []
+    for line in sorted(prominent, key=lambda item: item["top"]):
+        if not clusters:
+            clusters.append([line])
+            continue
+        previous = clusters[-1][-1]
+        previous_bottom = previous["top"] + previous["height"]
+        if line["top"] - previous_bottom <= largest_height * 1.35:
+            clusters[-1].append(line)
+        else:
+            clusters.append([line])
+
+    best_cluster = max(
+        clusters,
+        key=lambda cluster: (
+            len(cluster),
+            sum(line["height"] for line in cluster) / len(cluster),
+            sum(len(line["text"]) for line in cluster),
+            -cluster[0]["top"],
+        ),
+    )
+    return " ".join(line["text"] for line in best_cluster).strip()
+
+
+def extract_manager_from_ocr_text(text: str) -> str:
+    """Extract a legal entity or company name from the manager description."""
+    def company_before_description(value: str) -> str:
+        value = re.sub(r"\s+", " ", value).strip()
+        value = re.sub(r"^[^A-Za-z0-9]+", "", value)
+        match = re.match(
+            r"^([A-Z][A-Za-z0-9&'().,\-]*(?:\s+[A-Za-z0-9&'().,\-]+){0,7}?)"
+            r"\s+(?:builds?|provides?|offers?|manages?|creates?|is|speciali[sz]es?)\b",
+            value,
+            re.IGNORECASE,
+        )
+        return match.group(1).strip().rstrip(".,") if match else ""
+
+    for raw_line in text.splitlines():
+        line = re.sub(r"\s+", " ", raw_line).strip()
+        manager = extract_legal_entity_name(line)
+        if manager:
+            return manager
+        manager = company_before_description(line)
+        if manager:
+            return manager
+
+    # OCR may put the company and the opening verb on adjacent lines.
+    return company_before_description(text)
+
+
+def get_ocr_manager(page: fitz.Page) -> str:
+    """OCR the manager/company description beneath the lower-right SEBI area."""
+    import pytesseract
+
+    width = page.rect.width
+    height = page.rect.height
+    image = render_ocr_crop(
+        page,
+        fitz.Rect(width * 0.38, height * 0.78, width, height * 0.93),
+        target_width=1200,
+    )
+    try:
+        text = pytesseract.image_to_string(image, config="--psm 6")
+    finally:
+        image.close()
+    return extract_manager_from_ocr_text(text)
+
+
+def get_ocr_page_identity(page: fitz.Page) -> tuple[str, str]:
+    """Return OCR title and manager, degrading safely if OCR is unavailable."""
+    try:
+        title = get_ocr_title(page)
+    except Exception:
+        title = ""
+    try:
+        manager = get_ocr_manager(page)
+    except Exception:
+        manager = ""
+    return title, manager
+
+
 def get_manager_name(page: fitz.Page) -> str:
     """Return the value next to or below a supported manager label."""
     lines = [
@@ -448,12 +627,22 @@ def convert_pdf_bytes(
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     try:
         total_pages = len(doc)
+        ocr_checked = False
         for i, page in enumerate(doc, start=1):
-            legal_manager = get_lower_right_legal_manager(page)
-            manager_raw = legal_manager or get_manager_name(page)
-            title_raw = (
-                get_upper_left_title(page) if legal_manager else get_page_title(page)
-            )
+            page_text = page.get_text("text", sort=True).strip()
+            if len(page_text) < 20:
+                if not ocr_checked:
+                    ensure_ocr_available()
+                    ocr_checked = True
+                title_raw, manager_raw = get_ocr_page_identity(page)
+            else:
+                legal_manager = get_lower_right_legal_manager(page)
+                manager_raw = legal_manager or get_manager_name(page)
+                title_raw = (
+                    get_upper_left_title(page)
+                    if legal_manager
+                    else get_page_title(page)
+                )
             title_raw = title_raw or get_page_title(page) or f"Page {i:03d}"
             display_name = (
                 f"{title_raw} by {manager_raw}" if manager_raw else title_raw
@@ -469,12 +658,18 @@ def convert_pdf_bytes(
                 else f"{title} ({occurrence}).png"
             )
 
-            pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
+            target_width = OUTPUT_WIDTHS.get(zoom, 1400)
+            render_scale = target_width / max(page.rect.width, 1)
+            pix = page.get_pixmap(
+                matrix=fitz.Matrix(render_scale, render_scale),
+                alpha=False,
+            )
             image_path = output_dir / filename
             pix.save(str(image_path))
             del pix
+            thumbnail_scale = 360 / max(page.rect.width, 1)
             thumbnail_pix = page.get_pixmap(
-                matrix=fitz.Matrix(0.45, 0.45),
+                matrix=fitz.Matrix(thumbnail_scale, thumbnail_scale),
                 alpha=False,
             )
             thumbnail_path = thumbnail_dir / filename
