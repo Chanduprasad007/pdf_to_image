@@ -1,6 +1,7 @@
 from pathlib import Path
 from datetime import datetime
-from io import BytesIO
+import gc
+import os
 import re
 import zipfile
 import time
@@ -9,6 +10,9 @@ import shutil
 
 import fitz  # PyMuPDF
 import streamlit as st
+
+# Keep each Tesseract subprocess small enough for Streamlit Community Cloud.
+os.environ.setdefault("OMP_THREAD_LIMIT", "1")
 
 GOOGLE_DRIVE_SCOPE = "https://www.googleapis.com/auth/drive"
 GOOGLE_AUTHORIZE_URL = "https://accounts.google.com/o/oauth2/v2/auth"
@@ -19,6 +23,7 @@ DRIVE_ROOT_FOLDER_URL = (
     "https://drive.google.com/drive/folders/"
     f"{DRIVE_ROOT_FOLDER_ID}"
 )
+APP_STATE_VERSION = 2
 
 st.set_page_config(
     page_title="PDF Page Exporter",
@@ -276,11 +281,9 @@ LEGAL_ENTITY_SUFFIX = (
 )
 
 OUTPUT_WIDTHS = {
-    1.0: 1000,
-    1.5: 1400,
-    2.0: 1800,
-    2.5: 2200,
-    3.0: 2600,
+    1.0: 900,
+    1.5: 1200,
+    2.0: 1500,
 }
 
 
@@ -433,79 +436,33 @@ def render_ocr_crop(page: fitz.Page, clip: fitz.Rect, target_width: int = 950):
         del pix
 
 
-def get_native_page_image(page: fitz.Page):
-    """Return the largest embedded page image without rasterizing it again."""
-    from PIL import Image
-
-    candidates = sorted(
-        page.get_images(full=True),
-        key=lambda item: item[2] * item[3],
-        reverse=True,
-    )
-    if not candidates:
-        return None
-
-    xref, _smask, image_width, image_height = candidates[0][:4]
-    if image_width < 600 or image_height < 600:
-        return None
-    image_info = page.parent.extract_image(xref)
-    with Image.open(BytesIO(image_info["image"])) as source:
-        return source.convert("RGB")
-
-
 def get_ocr_region(
     page: fitz.Page,
     relative_box: tuple[float, float, float, float],
-    minimum_width: int,
-    native_image=None,
+    target_width: int,
 ):
-    """Crop and enhance a normalized region from the native page image."""
-    from PIL import Image, ImageOps
+    """Render only the text band needed for OCR and enhance its contrast."""
+    from PIL import ImageOps
 
-    owns_native_image = native_image is None
-    if owns_native_image:
-        try:
-            native_image = get_native_page_image(page)
-        except Exception:
-            native_image = None
-
-    if native_image is not None:
-        left, top, right, bottom = relative_box
-        crop = native_image.crop((
-            round(native_image.width * left),
-            round(native_image.height * top),
-            round(native_image.width * right),
-            round(native_image.height * bottom),
-        ))
-        if owns_native_image:
-            native_image.close()
-    else:
-        width = page.rect.width
-        height = page.rect.height
-        left, top, right, bottom = relative_box
-        crop = render_ocr_crop(
-            page,
-            fitz.Rect(
-                width * left,
-                height * top,
-                width * right,
-                height * bottom,
-            ),
-            target_width=minimum_width,
-        )
-
-    if crop.width < minimum_width:
-        scale = minimum_width / max(crop.width, 1)
-        resized = crop.resize(
-            (minimum_width, round(crop.height * scale)),
-            Image.Resampling.LANCZOS,
-        )
-        crop.close()
-        crop = resized
+    width = page.rect.width
+    height = page.rect.height
+    left, top, right, bottom = relative_box
+    crop = render_ocr_crop(
+        page,
+        fitz.Rect(
+            width * left,
+            height * top,
+            width * right,
+            height * bottom,
+        ),
+        target_width=target_width,
+    )
 
     enhanced = ImageOps.autocontrast(ImageOps.grayscale(crop), cutoff=1)
     crop.close()
-    return ImageOps.expand(enhanced, border=24, fill="white")
+    bordered = ImageOps.expand(enhanced, border=24, fill="white")
+    enhanced.close()
+    return bordered
 
 
 def ensure_ocr_available():
@@ -522,7 +479,7 @@ def ensure_ocr_available():
         ) from exc
 
 
-def get_ocr_title(page: fitz.Page, native_image=None) -> str:
+def get_ocr_title(page: fitz.Page) -> str:
     """OCR the upper-left title and select its largest contiguous line group."""
     import pytesseract
     from pytesseract import Output
@@ -530,14 +487,14 @@ def get_ocr_title(page: fitz.Page, native_image=None) -> str:
     image = get_ocr_region(
         page,
         (0.02, 0.12, 0.36, 0.35),
-        minimum_width=1700,
-        native_image=native_image,
+        target_width=900,
     )
     try:
         data = pytesseract.image_to_data(
             image,
-            config="--psm 6",
+            config="--oem 1 --psm 6",
             output_type=Output.DICT,
+            timeout=15,
         )
     finally:
         image.close()
@@ -626,18 +583,21 @@ def extract_manager_from_ocr_text(text: str) -> str:
     return company_before_description(text)
 
 
-def get_ocr_manager(page: fitz.Page, native_image=None) -> str:
+def get_ocr_manager(page: fitz.Page) -> str:
     """OCR the manager/company description beneath the lower-right SEBI area."""
     import pytesseract
 
     image = get_ocr_region(
         page,
         (0.40, 0.80, 0.97, 0.93),
-        minimum_width=2400,
-        native_image=native_image,
+        target_width=1300,
     )
     try:
-        text = pytesseract.image_to_string(image, config="--psm 6")
+        text = pytesseract.image_to_string(
+            image,
+            config="--oem 1 --psm 6",
+            timeout=15,
+        )
     finally:
         image.close()
     return extract_manager_from_ocr_text(text)
@@ -646,19 +606,13 @@ def get_ocr_manager(page: fitz.Page, native_image=None) -> str:
 def get_ocr_page_identity(page: fitz.Page) -> tuple[str, str]:
     """Return OCR title and manager, degrading safely if OCR is unavailable."""
     try:
-        native_image = get_native_page_image(page)
-    except Exception:
-        native_image = None
-    try:
-        title = get_ocr_title(page, native_image=native_image)
+        title = get_ocr_title(page)
     except Exception:
         title = ""
     try:
-        manager = get_ocr_manager(page, native_image=native_image)
+        manager = get_ocr_manager(page)
     except Exception:
         manager = ""
-    if native_image is not None:
-        native_image.close()
     return title, manager
 
 
@@ -739,7 +693,7 @@ def convert_pdf_bytes(
                 else f"{title} ({occurrence}).png"
             )
 
-            target_width = OUTPUT_WIDTHS.get(zoom, 1400)
+            target_width = OUTPUT_WIDTHS.get(zoom, 900)
             render_scale = target_width / max(page.rect.width, 1)
             pix = page.get_pixmap(
                 matrix=fitz.Matrix(render_scale, render_scale),
@@ -748,7 +702,7 @@ def convert_pdf_bytes(
             image_path = output_dir / filename
             pix.save(str(image_path))
             del pix
-            thumbnail_scale = 360 / max(page.rect.width, 1)
+            thumbnail_scale = 280 / max(page.rect.width, 1)
             thumbnail_pix = page.get_pixmap(
                 matrix=fitz.Matrix(thumbnail_scale, thumbnail_scale),
                 alpha=False,
@@ -766,6 +720,9 @@ def convert_pdf_bytes(
             })
             if progress_callback is not None:
                 progress_callback(i, total_pages)
+            # Periodically reclaim cyclic buffers without slowing every page.
+            if i % 4 == 0:
+                gc.collect()
     finally:
         doc.close()
 
@@ -835,7 +792,7 @@ def apply_page_rename(
 
 
 def selected_output(output: dict, output_index: int) -> dict:
-    """Return an output copy containing only currently selected pages."""
+    """Return selected pages without eagerly building a download in memory."""
     if output["error"] is not None:
         return output
 
@@ -847,12 +804,9 @@ def selected_output(output: dict, output_index: int) -> dict:
             True,
         )
     ]
-    zip_path = (
-        build_output_zip(output, kept_results) if kept_results else None
-    )
     filtered = dict(output)
     filtered["results"] = kept_results
-    filtered["zip_path"] = zip_path
+    filtered["zip_path"] = None
     return filtered
 
 
@@ -1473,18 +1427,16 @@ control_col, action_col = st.columns([1.15, 1], vertical_alignment="bottom")
 with control_col:
     zoom = st.select_slider(
         "Image resolution",
-        options=[1.0, 1.5, 2.0, 2.5, 3.0],
-        value=1.5,
+        options=[1.0, 1.5, 2.0],
+        value=1.0,
         format_func=lambda value: {
             1.0: "Standard",
             1.5: "Balanced",
             2.0: "High",
-            2.5: "Very high",
-            3.0: "Maximum",
         }[value],
         help=(
-            "Balanced is recommended for speed. Higher resolutions create "
-            "sharper PNGs but take longer and use substantially more memory."
+            "Standard is recommended on Streamlit Community Cloud. Higher "
+            "resolutions create sharper PNGs but use more memory."
         ),
     )
 
@@ -1504,7 +1456,12 @@ if uploaded_files:
         f"({format_file_size(total_upload_size)} total)."
     )
 
-if "conversion_outputs" not in st.session_state:
+if st.session_state.get("app_state_version") != APP_STATE_VERSION:
+    cleanup_batch_temp_dir(st.session_state.get("batch_temp_dir"))
+    st.session_state.pop("batch_temp_dir", None)
+    st.session_state.conversion_outputs = []
+    st.session_state.app_state_version = APP_STATE_VERSION
+elif "conversion_outputs" not in st.session_state:
     st.session_state.conversion_outputs = []
 elif any(
     output.get("results")
@@ -1541,8 +1498,9 @@ if process and uploaded_files:
             )
 
         try:
+            uploaded.seek(0)
             total_pages, results = convert_pdf_bytes(
-                uploaded.getvalue(),
+                uploaded,
                 uploaded.name,
                 working_dir,
                 zoom=zoom,
@@ -1599,26 +1557,77 @@ if st.session_state.conversion_outputs:
         if output["error"] is None and output["results"]
     ]
 
-    summary_col, batch_download_col = st.columns(
-        [1.7, 1],
-        vertical_alignment="center",
-    )
-    with summary_col:
-        if successful_outputs:
-            st.success(
-                f"Finished {successful_outputs} of "
-                f"{len(st.session_state.conversion_outputs)} PDF files."
+    if successful_outputs:
+        st.success(
+            f"Finished {successful_outputs} of "
+            f"{len(st.session_state.conversion_outputs)} PDF files."
+        )
+
+    # Streamlit keeps download payloads in memory. Offer one selected payload
+    # at a time instead of preloading every report ZIP plus the master ZIP.
+    if downloadable_outputs:
+        download_options = [
+            f"report:{index}" for index, output in enumerate(
+                selected_conversion_outputs
             )
-    with batch_download_col:
+            if output["error"] is None and output["results"]
+        ]
         if len(downloadable_outputs) > 1:
-            batch_zip_path = create_batch_zip(downloadable_outputs)
-            with open(batch_zip_path, "rb") as batch_zip_file:
+            download_options.append("all")
+
+        def download_label(option: str) -> str:
+            if option == "all":
+                return f"All {len(downloadable_outputs)} report ZIPs"
+            output_index = int(option.split(":", 1)[1])
+            return selected_conversion_outputs[output_index]["original_name"]
+
+        selector_col, button_col = st.columns(
+            [1.7, 1],
+            vertical_alignment="bottom",
+        )
+        with selector_col:
+            download_choice = st.selectbox(
+                "Choose a download",
+                options=download_options,
+                format_func=download_label,
+                key="download_choice",
+            )
+
+        if download_choice == "all":
+            prepared_outputs = []
+            for output_index, output in enumerate(selected_conversion_outputs):
+                if output["error"] is not None or not output["results"]:
+                    continue
+                source_output = st.session_state.conversion_outputs[output_index]
+                prepared = dict(output)
+                prepared["zip_path"] = build_output_zip(
+                    source_output,
+                    output["results"],
+                )
+                prepared["zip_signature"] = source_output["zip_signature"]
+                prepared_outputs.append(prepared)
+            download_path = create_batch_zip(prepared_outputs)
+            download_name = "all_pdf_image_zips.zip"
+            download_text = f"Download all {len(prepared_outputs)} ZIPs"
+        else:
+            chosen_index = int(download_choice.split(":", 1)[1])
+            chosen_output = selected_conversion_outputs[chosen_index]
+            source_output = st.session_state.conversion_outputs[chosen_index]
+            download_path = build_output_zip(
+                source_output,
+                chosen_output["results"],
+            )
+            download_name = output_zip_name(chosen_output["original_name"])
+            download_text = "Download selected ZIP"
+
+        with button_col:
+            with open(download_path, "rb") as selected_zip_file:
                 st.download_button(
-                    label=f"Download all {len(downloadable_outputs)} ZIPs",
-                    data=batch_zip_file,
-                    file_name="all_pdf_image_zips.zip",
+                    label=download_text,
+                    data=selected_zip_file,
+                    file_name=download_name,
                     mime="application/zip",
-                    key="download_all_zips",
+                    key=f"download_selected_{download_choice}",
                     use_container_width=True,
                 )
 
@@ -1631,8 +1640,8 @@ if st.session_state.conversion_outputs:
                 st.error(f"This PDF could not be processed: {output['error']}")
                 continue
 
-            result_col, download_col, drive_col = st.columns(
-                [1.7, 0.8, 0.8],
+            result_col, drive_col = st.columns(
+                [2.5, 0.8],
                 vertical_alignment="center",
             )
             with result_col:
@@ -1648,18 +1657,6 @@ if st.session_state.conversion_outputs:
                     '</div>',
                     unsafe_allow_html=True,
                 )
-            with download_col:
-                zip_name = output_zip_name(output["original_name"])
-                if converted_count:
-                    with open(output["zip_path"], "rb") as zip_file:
-                        st.download_button(
-                            label="Download ZIP",
-                            data=zip_file,
-                            file_name=zip_name,
-                            mime="application/zip",
-                            key=f"download_{output_index}_{zip_name}",
-                            use_container_width=True,
-                        )
             with drive_col:
                 if converted_count:
                     render_report_drive_sync(
